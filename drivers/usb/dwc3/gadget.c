@@ -2610,13 +2610,13 @@ static void dwc3_gadget_wakeup_interrupt(struct dwc3 *dwc)
 {
 	dev_vdbg(dwc->dev, "%s\n", __func__);
 
-	/*
-	 * TODO take core out of low power mode when that's
-	 * implemented.
-	 */
+	/* Only perform resume from L2 or Early suspend states */
+	if (dwc->link_state == DWC3_LINK_STATE_U3) {
+		dbg_event(0xFF, "WAKEUP", 0);
+		dwc->gadget_driver->resume(&dwc->gadget);
+	}
 
-	dbg_event(0xFF, "WAKEUP", 0);
-	dwc->gadget_driver->resume(&dwc->gadget);
+	dwc->link_state = DWC3_LINK_STATE_U0;
 }
 
 static void dwc3_gadget_linksts_change_interrupt(struct dwc3 *dwc,
@@ -2707,8 +2707,6 @@ static void dwc3_dump_reg_info(struct dwc3 *dwc)
 	dbg_print_reg("OCTL", dwc3_readl(dwc->regs, DWC3_OCTL));
 	dbg_print_reg("OEVT", dwc3_readl(dwc->regs, DWC3_OEVT));
 	dbg_print_reg("OSTS", dwc3_readl(dwc->regs, DWC3_OSTS));
-
-	dwc3_notify_event(dwc, DWC3_CONTROLLER_ERROR_EVENT);
 }
 
 static void dwc3_gadget_interrupt(struct dwc3 *dwc,
@@ -2737,9 +2735,11 @@ static void dwc3_gadget_interrupt(struct dwc3 *dwc,
 		dev_vdbg(dwc->dev, "Start of Periodic Frame\n");
 		break;
 	case DWC3_DEVICE_EVENT_ERRATIC_ERROR:
-		dbg_event(0xFF, "ERROR", 0);
-		dev_vdbg(dwc->dev, "Erratic Error\n");
-		dwc3_dump_reg_info(dwc);
+		if (!dwc->err_evt_seen) {
+			dbg_event(0xFF, "ERROR", 0);
+			dev_vdbg(dwc->dev, "Erratic Error\n");
+			dwc3_dump_reg_info(dwc);
+		}
 		break;
 	case DWC3_DEVICE_EVENT_CMD_CMPL:
 		dev_vdbg(dwc->dev, "Command Complete\n");
@@ -2779,6 +2779,8 @@ static void dwc3_gadget_interrupt(struct dwc3 *dwc,
 	default:
 		dev_dbg(dwc->dev, "UNKNOWN IRQ %d\n", event->type);
 	}
+
+	dwc->err_evt_seen = (event->type == DWC3_DEVICE_EVENT_ERRATIC_ERROR);
 }
 
 static void dwc3_process_event_entry(struct dwc3 *dwc,
@@ -2820,6 +2822,22 @@ static irqreturn_t dwc3_process_event_buf(struct dwc3 *dwc, u32 buf)
 		event.raw = *(u32 *) (evt->buf + evt->lpos);
 
 		dwc3_process_event_entry(dwc, &event);
+
+		if (dwc->err_evt_seen) {
+			/*
+			 * if erratic error, skip remaining events
+			 * while controller undergoes reset
+			 */
+			evt->lpos = (evt->lpos + left) %
+					DWC3_EVENT_BUFFERS_SIZE;
+			dwc3_writel(dwc->regs, DWC3_GEVNTCOUNT(buf),
+					left);
+			if (dwc3_notify_event(dwc,
+					DWC3_CONTROLLER_ERROR_EVENT))
+				dwc->err_evt_seen = 0;
+			break;
+		}
+
 		/*
 		 * XXX we wrap around correctly to the next entry as almost all
 		 * entries are 4 bytes in size. There is one entry which has 12
@@ -2844,12 +2862,23 @@ static irqreturn_t dwc3_interrupt(int irq, void *_dwc)
 
 	spin_lock(&dwc->lock);
 
+	dwc->irq_cnt++;
+
+	if (dwc->err_evt_seen) {
+		/* controller reset is still pending */
+		spin_unlock(&dwc->lock);
+		return IRQ_HANDLED;
+	}
+
 	for (i = 0; i < dwc->num_event_buffers; i++) {
 		irqreturn_t status;
 
 		status = dwc3_process_event_buf(dwc, i);
 		if (status == IRQ_HANDLED)
 			ret = status;
+
+		if (dwc->err_evt_seen)
+			break;
 	}
 
 	spin_unlock(&dwc->lock);

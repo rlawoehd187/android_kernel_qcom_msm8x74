@@ -130,7 +130,9 @@ struct fcc_sample {
 struct bms_irq {
 	unsigned int	irq;
 	unsigned long	disabled;
+	unsigned long	wake_enabled;
 	bool		ready;
+	bool		is_wake;
 };
 
 struct bms_wakeup_source {
@@ -398,6 +400,9 @@ static void enable_bms_irq(struct bms_irq *irq)
 	if (irq->ready && __test_and_clear_bit(0, &irq->disabled)) {
 		enable_irq(irq->irq);
 		pr_debug("enabled irq %d\n", irq->irq);
+		if ((irq->is_wake) &&
+				!__test_and_set_bit(0, &irq->wake_enabled))
+			enable_irq_wake(irq->irq);
 	}
 }
 
@@ -406,6 +411,9 @@ static void disable_bms_irq(struct bms_irq *irq)
 	if (irq->ready && !__test_and_set_bit(0, &irq->disabled)) {
 		disable_irq(irq->irq);
 		pr_debug("disabled irq %d\n", irq->irq);
+		if ((irq->is_wake) &&
+				__test_and_clear_bit(0, &irq->wake_enabled))
+			disable_irq_wake(irq->irq);
 	}
 }
 
@@ -414,6 +422,9 @@ static void disable_bms_irq_nosync(struct bms_irq *irq)
 	if (irq->ready && !__test_and_set_bit(0, &irq->disabled)) {
 		disable_irq_nosync(irq->irq);
 		pr_debug("disabled irq %d\n", irq->irq);
+		if ((irq->is_wake) &&
+				__test_and_clear_bit(0, &irq->wake_enabled))
+			disable_irq_wake(irq->irq);
 	}
 }
 
@@ -2209,7 +2220,6 @@ skip_limits:
 	rc_new_uah = (params->fcc_uah * pc_new) / 100;
 	soc_new = (rc_new_uah - params->cc_uah - params->uuc_uah)*100
 					/ (params->fcc_uah - params->uuc_uah);
-	soc_new = bound_soc(soc_new);
 
 	/*
 	 * if soc_new is ZERO force it higher so that phone doesnt report soc=0
@@ -2467,6 +2477,8 @@ static int calculate_state_of_charge(struct qpnp_bms_chip *chip,
 	/* always clamp soc due to BMS hw/sw immaturities */
 	new_calculated_soc = clamp_soc_based_on_voltage(chip,
 					new_calculated_soc);
+
+	new_calculated_soc = bound_soc(new_calculated_soc);
 	/*
 	 * If the battery is full, configure the cc threshold so the system
 	 * wakes up after SoC changes
@@ -3959,11 +3971,11 @@ static int bms_request_irqs(struct qpnp_bms_chip *chip)
 	int rc;
 
 	SPMI_REQUEST_IRQ(chip, rc, sw_cc_thr);
+	chip->sw_cc_thr_irq.is_wake = true;
 	disable_bms_irq(&chip->sw_cc_thr_irq);
-	enable_irq_wake(chip->sw_cc_thr_irq.irq);
 	SPMI_REQUEST_IRQ(chip, rc, ocv_thr);
+	chip->ocv_thr_irq.is_wake = true;
 	disable_bms_irq(&chip->ocv_thr_irq);
-	enable_irq_wake(chip->ocv_thr_irq.irq);
 	return 0;
 }
 
